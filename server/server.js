@@ -2,13 +2,16 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { GoogleGenAI } = require("@google/genai");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const speakeasy = require("speakeasy");
 const path = require("path");
 const { MongoClient, ObjectId } = require("mongodb");
 
 dotenv.config({ path: path.join(__dirname, ".env") });
 
 const app = express();
-const PORT = 5050;
+const PORT = process.env.PORT || 5050;
 const MAX_GEMINI_RETRIES = 2;
 const GEMINI_RETRY_DELAY_MS = 1000;
 const TEMPORARY_ERROR_MESSAGE =
@@ -20,8 +23,9 @@ const mongoClient = process.env.MONGODB_URI
   ? new MongoClient(process.env.MONGODB_URI)
   : null;
 let mongoDatabasePromise;
+let usersCollectionPromise;
 
-const getConversationsCollection = async () => {
+const getMongoDatabase = async () => {
   if (!mongoClient) {
     throw new Error("MONGODB_URI is not configured.");
   }
@@ -29,9 +33,7 @@ const getConversationsCollection = async () => {
   if (!mongoDatabasePromise) {
     mongoDatabasePromise = mongoClient
       .connect()
-      .then((client) =>
-        client.db(process.env.MONGODB_DB_NAME || "tutorai").collection("conversations")
-      )
+      .then((client) => client.db(process.env.MONGODB_DB_NAME || "tutorai"))
       .catch((error) => {
         mongoDatabasePromise = undefined;
         throw error;
@@ -39,6 +41,28 @@ const getConversationsCollection = async () => {
   }
 
   return mongoDatabasePromise;
+};
+
+const getConversationsCollection = async () => {
+  const database = await getMongoDatabase();
+  return database.collection("conversations");
+};
+
+const getUsersCollection = async () => {
+  if (!usersCollectionPromise) {
+    usersCollectionPromise = getMongoDatabase()
+      .then(async (database) => {
+        const collection = database.collection("users");
+        await collection.createIndex({ email: 1 }, { unique: true });
+        return collection;
+      })
+      .catch((error) => {
+        usersCollectionPromise = undefined;
+        throw error;
+      });
+  }
+
+  return usersCollectionPromise;
 };
 
 const isValidObjectId = (id) => typeof id === "string" && ObjectId.isValid(id);
@@ -51,6 +75,43 @@ const toConversationResponse = ({ _id, ...conversation }) => ({
 const handleMongoError = (res, error) => {
   console.error("MongoDB Error:", error);
   return res.status(503).json({ error: MONGODB_UNAVAILABLE_MESSAGE });
+};
+
+const getSafeUser = ({ _id, name, email }) => ({
+  id: _id.toString(),
+  name,
+  email,
+});
+
+const getCredentials = (body) => ({
+  email: typeof body?.email === "string" ? body.email.trim().toLowerCase() : "",
+  password: typeof body?.password === "string" ? body.password : "",
+});
+
+const authenticateRequest = (req, res, next) => {
+  const authorization = req.get("Authorization");
+  const tokenMatch = authorization?.match(/^Bearer\s+(\S+)$/);
+
+  if (!tokenMatch || !process.env.JWT_SECRET) {
+    return res.status(401).json({ error: "Authentication required." });
+  }
+
+  try {
+    const payload = jwt.verify(tokenMatch[1], process.env.JWT_SECRET);
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      typeof payload.sub !== "string" ||
+      !isValidObjectId(payload.sub)
+    ) {
+      return res.status(401).json({ error: "Authentication required." });
+    }
+
+    req.userId = payload.sub;
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Authentication required." });
+  }
 };
 
 const delay = (milliseconds) =>
@@ -86,6 +147,215 @@ app.get("/", (req, res) => {
   res.json({
     message: "tutorAi backend is running!"
   });
+});
+
+app.get("/api/instance", (req, res) => {
+  res.json({
+    instance: process.env.HOSTNAME || "local",
+    message: "Request handled successfully",
+  });
+});
+
+app.post("/api/auth/signup", async (req, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  const { email, password } = getCredentials(req.body);
+
+  if (!name || !email || !password) {
+    return res.status(400).json({
+      error: "Name, email, and password are required.",
+    });
+  }
+
+  if (password.length < 8) {
+    return res.status(400).json({
+      error: "Password must be at least 8 characters long.",
+    });
+  }
+
+  try {
+    const users = await getUsersCollection();
+    const existingUser = await users.findOne({ email }, { projection: { _id: 1 } });
+    if (existingUser) {
+      return res.status(409).json({ error: "Email is already registered." });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = {
+      name,
+      email,
+      passwordHash,
+      createdAt: new Date(),
+    };
+    const result = await users.insertOne(user);
+
+    return res.status(201).json({
+      message: "Account created successfully.",
+      user: getSafeUser({ ...user, _id: result.insertedId }),
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ error: "Email is already registered." });
+    }
+    return handleMongoError(res, error);
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = getCredentials(req.body);
+  const mfaCode =
+    typeof req.body?.mfaCode === "string" ? req.body.mfaCode.trim() : "";
+
+  if (!email || !password) {
+    return res.status(400).json({
+      error: "Email and password are required.",
+    });
+  }
+
+  try {
+    const users = await getUsersCollection();
+    const user = await users.findOne({ email });
+    const isValidPassword = user
+      ? await bcrypt.compare(password, user.passwordHash)
+      : false;
+
+    if (!user || !isValidPassword) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    if (user.mfaEnabled) {
+      if (!/^\d{6}$/.test(mfaCode) || typeof user.mfaSecret !== "string") {
+        return res.status(401).json({
+          error: "MFA verification is required.",
+          mfaRequired: true,
+        });
+      }
+
+      const isValidMfaCode = speakeasy.totp.verify({
+        secret: user.mfaSecret,
+        encoding: "base32",
+        token: mfaCode,
+        window: 1,
+      });
+
+      if (!isValidMfaCode) {
+        return res.status(401).json({
+          error: "Invalid MFA code.",
+          mfaRequired: true,
+        });
+      }
+    }
+
+    if (!process.env.JWT_SECRET) {
+      console.error("JWT_SECRET is not configured.");
+      return res.status(500).json({ error: "Authentication is not configured." });
+    }
+
+    const token = jwt.sign(
+      { sub: user._id.toString(), email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" },
+    );
+
+    return res.json({
+      token,
+      expiresIn: 3600,
+      user: getSafeUser(user),
+    });
+  } catch (error) {
+    return handleMongoError(res, error);
+  }
+});
+
+app.post("/api/auth/mfa/setup", authenticateRequest, async (req, res) => {
+  try {
+    const users = await getUsersCollection();
+    const user = await users.findOne(
+      { _id: new ObjectId(req.userId) },
+      { projection: { name: 1, email: 1, mfaEnabled: 1 } },
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    if (user.mfaEnabled) {
+      return res.status(409).json({ error: "MFA is already enabled." });
+    }
+
+    const secret = speakeasy.generateSecret({
+      length: 20,
+      name: `TutorAI:${user.email}`,
+      issuer: "TutorAI",
+    });
+
+    await users.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          mfaSecret: secret.base32,
+          mfaEnabled: false,
+        },
+      },
+    );
+
+    return res.json({
+      secret: secret.base32,
+      otpauthUrl: secret.otpauth_url,
+    });
+  } catch (error) {
+    return handleMongoError(res, error);
+  }
+});
+
+app.post("/api/auth/mfa/verify", authenticateRequest, async (req, res) => {
+  const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ error: "A six-digit MFA code is required." });
+  }
+
+  try {
+    const users = await getUsersCollection();
+    const user = await users.findOne(
+      { _id: new ObjectId(req.userId) },
+      { projection: { name: 1, email: 1, mfaSecret: 1, mfaEnabled: 1 } },
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    if (!user.mfaSecret) {
+      return res.status(400).json({ error: "MFA setup is required first." });
+    }
+
+    if (user.mfaEnabled) {
+      return res.status(409).json({ error: "MFA is already enabled." });
+    }
+
+    const isValidMfaCode = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: "base32",
+      token: code,
+      window: 1,
+    });
+
+    if (!isValidMfaCode) {
+      return res.status(401).json({ error: "Invalid MFA code." });
+    }
+
+    await users.updateOne(
+      { _id: new ObjectId(req.userId), mfaEnabled: { $ne: true } },
+      { $set: { mfaEnabled: true } },
+    );
+
+    return res.json({
+      message: "MFA enabled successfully.",
+      user: getSafeUser(user),
+    });
+  } catch (error) {
+    return handleMongoError(res, error);
+  }
 });
 
 // AI Teacher
@@ -215,7 +485,7 @@ Style constraints:
   }
 });
 
-app.post("/api/conversations", async (req, res) => {
+app.post("/api/conversations", authenticateRequest, async (req, res) => {
   try {
     const { title, messages } = req.body;
     if (typeof title !== "string" || !Array.isArray(messages)) {
@@ -228,6 +498,7 @@ app.post("/api/conversations", async (req, res) => {
     const conversation = {
       title,
       messages,
+      userId: new ObjectId(req.userId),
       createdAt: now,
       updatedAt: now,
     };
@@ -245,11 +516,11 @@ app.post("/api/conversations", async (req, res) => {
   }
 });
 
-app.get("/api/conversations", async (req, res) => {
+app.get("/api/conversations", authenticateRequest, async (req, res) => {
   try {
     const collection = await getConversationsCollection();
     const conversations = await collection
-      .find({})
+      .find({ userId: new ObjectId(req.userId) })
       .sort({ updatedAt: -1 })
       .toArray();
     return res.json(conversations.map(toConversationResponse));
@@ -258,7 +529,7 @@ app.get("/api/conversations", async (req, res) => {
   }
 });
 
-app.get("/api/conversations/:id", async (req, res) => {
+app.get("/api/conversations/:id", authenticateRequest, async (req, res) => {
   if (!isValidObjectId(req.params.id)) {
     return res.status(400).json({ error: "Invalid conversation ID." });
   }
@@ -267,6 +538,7 @@ app.get("/api/conversations/:id", async (req, res) => {
     const collection = await getConversationsCollection();
     const conversation = await collection.findOne({
       _id: new ObjectId(req.params.id),
+      userId: new ObjectId(req.userId),
     });
     if (!conversation) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -277,7 +549,7 @@ app.get("/api/conversations/:id", async (req, res) => {
   }
 });
 
-app.patch("/api/conversations/:id", async (req, res) => {
+app.patch("/api/conversations/:id", authenticateRequest, async (req, res) => {
   if (!isValidObjectId(req.params.id)) {
     return res.status(400).json({ error: "Invalid conversation ID." });
   }
@@ -304,7 +576,10 @@ app.patch("/api/conversations/:id", async (req, res) => {
     }
 
     const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      {
+        _id: new ObjectId(req.params.id),
+        userId: new ObjectId(req.userId),
+      },
       update,
       { returnDocument: "after" },
     );
@@ -317,7 +592,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/conversations/:id", async (req, res) => {
+app.delete("/api/conversations/:id", authenticateRequest, async (req, res) => {
   if (!isValidObjectId(req.params.id)) {
     return res.status(400).json({ error: "Invalid conversation ID." });
   }
@@ -326,6 +601,7 @@ app.delete("/api/conversations/:id", async (req, res) => {
     const collection = await getConversationsCollection();
     const result = await collection.deleteOne({
       _id: new ObjectId(req.params.id),
+      userId: new ObjectId(req.userId),
     });
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -336,6 +612,6 @@ app.delete("/api/conversations/:id", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`tutorAi server running on http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`tutorAi server running on port ${PORT}`);
 });
